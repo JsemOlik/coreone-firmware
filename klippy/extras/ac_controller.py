@@ -53,6 +53,10 @@ CMD_START_APP = 0           # prusa3d.common.CustomExecuteCommand
 
 HEARTBEAT_PERIOD = 1.
 HEARTBEAT_OFFLINE = 3.
+# AC_TEST_HOST_LOSS: HEARTBEAT_MISSING and DATA_TIMEOUT are expected, and
+# get this long to clear once the host is back
+LOSS_TEST_FAULTS = (1 << 30) | (1 << 29)
+LOSS_TEST_GRACE = 10.
 
 # prusa3d.ac_controller.Status.1.0 FAULT_* and SharedFault bits
 FAULT_NAMES = {
@@ -407,6 +411,7 @@ class ACController:
                                self.cmd_AC_TEST_HOST_LOSS,
                                desc=self.cmd_AC_TEST_HOST_LOSS_help)
         self.loss_test = None
+        self.loss_grace_until = 0.
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
@@ -575,6 +580,9 @@ class ACController:
         self.status_raw = bytes(x.payload)
         self.last_status_time = eventtime
         faults = st['faults'] & ~self.ignore_mask
+        if self.loss_test is not None or eventtime < self.loss_grace_until:
+            # The host-loss test provokes these on purpose
+            faults &= ~LOSS_TEST_FAULTS
         if faults:
             self.printer.invoke_shutdown("AC Controller fault: %s" % (
                 ", ".join(fault_names(faults)),))
@@ -601,12 +609,13 @@ class ACController:
         if test is not None:
             node = self.nodes.get(x.source, {}).get('hb') or {}
             key = (st['bed_target'], st['bed_pwm'] > 0., node.get('mode'),
-                   node.get('health'))
+                   node.get('health'), st['faults'])
             if key != test['last']:
                 test['last'] = key
-                test['events'].append((eventtime - test['start'], st['bed_target'],
-                                       st['bed_pwm'], temp, node.get('mode'),
-                                       node.get('health')))
+                test['events'].append((eventtime - test['start'],
+                                       st['bed_target'], st['bed_pwm'], temp,
+                                       node.get('mode'), node.get('health'),
+                                       st['faults']))
         want = self.heater.get_target() or None
         have = st['bed_target']
         if (want is None) != (have is None) or (
@@ -739,13 +748,15 @@ class ACController:
                           % (secs,))
     def _finish_loss_test(self, eventtime):
         test, self.loss_test = self.loss_test, None
+        self.loss_grace_until = eventtime + LOSS_TEST_GRACE
         self.config_dirty = True
         lines = ["AC_TEST_HOST_LOSS done (%.0fs). Changes seen:"
                  % (test['end'] - test['start'],)]
-        for t, target, pwm, temp, mode, health in test['events']:
+        for t, target, pwm, temp, mode, health, faults in test['events']:
             lines.append("  +%.1fs target=%s pwm=%.2f bed=%.1fC mode=%s"
-                         " health=%s" % (t, target, pwm, temp,
-                                         MODE_NAMES.get(mode, mode), health))
+                         " health=%s faults=%s" % (
+                             t, target, pwm, temp, MODE_NAMES.get(mode, mode),
+                             health, ",".join(fault_names(faults)) or 'none'))
         if not test['events']:
             lines.append("  no status received")
         logging.info("ac_controller: %s", "\n".join(lines))
