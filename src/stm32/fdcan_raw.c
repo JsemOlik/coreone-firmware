@@ -6,14 +6,20 @@
 // all of Cyphal (framing, CRC, node allocation, heartbeat, DSDL).
 //
 // Safety model: the master heartbeat and every bed target come from the host.
-// On MCU shutdown the controller is forced into INIT (off the bus) and the bus
-// enable line is released, so a shut-down MCU can never keep the bus alive.
-// A host watchdog covers a dead or hung host (which never sends a shutdown):
-// once armed by the first transmit, if no fdcan_raw_tx arrives within
-// watchdog_ms the bus is taken down the same way, pending frames are dropped,
-// and only a fresh transmit from a live host brings it back. It deliberately
-// does not shut the MCU down, so a host-only RESTART recovers without a
-// FIRMWARE_RESTART.
+// The AC Controller keeps its last bed target when the master goes silent (it
+// only raises HEARTBEAT_MISSING), so going quiet is not enough: the host hands
+// over a ready-made single-frame "bed off" transfer (fdcan_raw_set_safe) that
+// this module sends by itself when the host is lost or the MCU shuts down.
+// - Host watchdog (a dead or hung host never sends a shutdown): once armed by
+//   the first transmit, if no fdcan_raw_tx arrives within watchdog_ms, queued
+//   host frames are dropped and the safe frame is sent. The bus stays up so
+//   the host can still see the AC Controller, and the MCU is not shut down,
+//   so a host-only RESTART recovers.
+// - MCU shutdown: queued host frames are dropped, the safe frame is sent, and
+//   shortly after the controller goes into INIT (off the bus) with the bus
+//   enable line released.
+// The safe frame is repeated with consecutive transfer IDs, so the receiver
+// never discards it as a duplicate of the host's last transfer.
 //
 // Bus timing matches Prusa's xBuddy-extension firmware: CAN FD frames without
 // bit-rate switching at 125 kbit/s, 87.5% sample point, from a 48 MHz kernel
@@ -44,6 +50,8 @@
 #define FDR_RX_RING 16          // frames (power of two)
 #define FDR_TX_RING 8           // frames (power of two)
 #define FDR_PACE_US 1000        // min spacing of forwarded rx frames
+#define FDR_SAFE_REPEAT 3       // copies of the safe frame per send
+#define FDR_CLOSE_US 100000     // time to send it before going off the bus
 
 // FDCAN message RAM (fixed layout on G0/G4/H5: 72-byte elements)
 struct fdcan_fifo {
@@ -91,6 +99,12 @@ static struct fdr {
     struct timer wd_timer;
     uint32_t wd_ticks, wd_deadline, wd_trips;
     uint8_t wd_armed, bus_off;
+    // "bed off" frame sent when the host is lost or on shutdown
+    struct fdr_frame safe;
+    uint8_t safe_stage[64];
+    uint8_t safe_stage_len, safe_tid;
+    uint32_t safe_sends;
+    struct timer close_timer;
 } fdr;
 
 static struct task_wake fdr_wake;
@@ -188,17 +202,25 @@ fdr_bus_off(void)
     fdr.bus_off = 1;
 }
 
+// Drop queued host frames and queue the safe frame in their place. Frames
+// already in the hardware fifo still go out first, so the safe frame is the
+// last word either way.
 static void
-fdr_bus_on(void)
+fdr_send_safe(void)
 {
-    // A frame held in hardware from before the bus went down (possibly an
-    // old bed target) must never go out after recovery.
-    FDCAN1->TXBCR = 0x7;
-    gpio_out_write(fdr.enable, fdr.enable_on);
-    FDCAN1->CCCR &= ~FDCAN_CCCR_INIT;
-    while (FDCAN1->CCCR & FDCAN_CCCR_INIT)
-        ;
-    fdr.bus_off = 0;
+    fdr.tx_head = fdr.tx_tail = 0;
+    if (!fdr.safe.len || fdr.bus_off)
+        return;
+    int i;
+    for (i = 0; i < FDR_SAFE_REPEAT; i++) {
+        struct fdr_frame *f = &fdr.tx[fdr.tx_head % FDR_TX_RING];
+        *f = fdr.safe;
+        uint8_t *tail = &f->data[f->len - 1];
+        *tail = (*tail & 0xe0) | (fdr.safe_tid++ & 0x1f);
+        fdr.tx_head++;
+    }
+    fdr.safe_sends++;
+    fdr_tx_kick();
 }
 
 static uint_fast8_t
@@ -208,9 +230,16 @@ fdr_wd_event(struct timer *t)
         t->waketime = fdr.wd_deadline;
         return SF_RESCHEDULE;
     }
-    fdr_bus_off();
+    fdr_send_safe();
     fdr.wd_armed = 0;
     fdr.wd_trips++;
+    return SF_DONE;
+}
+
+static uint_fast8_t
+fdr_close_event(struct timer *t)
+{
+    fdr_bus_off();
     return SF_DONE;
 }
 
@@ -300,33 +329,42 @@ DECL_COMMAND(command_config_fdcan_raw,
              "config_fdcan_raw oid=%c rx_pin=%u tx_pin=%u"
              " enable_pin=%u enable_invert=%c watchdog_ms=%u");
 
-void
-command_fdcan_raw_tx(uint32_t *args)
+// Collect one chunk of a host frame into buf; returns the frame length once
+// the last chunk is in, -1 while more chunks follow or on a bad frame.
+static int
+fdr_collect(uint8_t *buf, uint8_t *pos, uint32_t *args)
 {
     if (!fdr.configured || args[0] != fdr.oid)
         shutdown("fdcan_raw not configured");
-    uint32_t id = args[1];
     uint8_t flags = args[2], len = args[3];
     uint8_t *data = command_decode_ptr(args[4]);
-    if (fdr.stage_len + len > sizeof(fdr.stage)) {
-        fdr.stage_len = 0;
+    if (*pos + len > 64) {
+        *pos = 0;
         fdr.bad_cmd++;
-        return;
+        return -1;
     }
-    memcpy(&fdr.stage[fdr.stage_len], data, len);
-    fdr.stage_len += len;
+    memcpy(&buf[*pos], data, len);
+    *pos += len;
     if (flags & 1)
+        return -1;
+    uint8_t flen = *pos;
+    *pos = 0;
+    return flen;
+}
+
+void
+command_fdcan_raw_tx(uint32_t *args)
+{
+    int flen = fdr_collect(fdr.stage, &fdr.stage_len, args);
+    if (flen < 0)
         return;
-    uint8_t flen = fdr.stage_len;
-    fdr.stage_len = 0;
     if (len_to_dlc(flen) < 0) {
         fdr.bad_cmd++;
         return;
     }
+    uint32_t id = args[1];
     irqstatus_t flag = irq_save();
     fdr_wd_feed();
-    if (fdr.bus_off)
-        fdr_bus_on();
     if ((uint8_t)(fdr.tx_head - fdr.tx_tail) >= FDR_TX_RING) {
         fdr.tx_overflow++;
     } else {
@@ -342,15 +380,39 @@ command_fdcan_raw_tx(uint32_t *args)
 DECL_COMMAND(command_fdcan_raw_tx,
              "fdcan_raw_tx oid=%c id=%u flags=%c data=%*s");
 
+// Set (or clear, with an empty frame) the safe frame. It must be a complete
+// single-frame Cyphal transfer: its tail byte gets a fresh transfer ID on
+// every send.
+void
+command_fdcan_raw_set_safe(uint32_t *args)
+{
+    int flen = fdr_collect(fdr.safe_stage, &fdr.safe_stage_len, args);
+    if (flen < 0)
+        return;
+    if (flen && (len_to_dlc(flen) < 0
+                 || (fdr.safe_stage[flen - 1] & 0xe0) != 0xe0)) {
+        fdr.bad_cmd++;
+        return;
+    }
+    irqstatus_t flag = irq_save();
+    fdr.safe.id = args[1];
+    fdr.safe.len = flen;
+    memcpy(fdr.safe.data, fdr.safe_stage, flen);
+    fdr.safe_tid = flen ? fdr.safe_stage[flen - 1] : 0;
+    irq_restore(flag);
+}
+DECL_COMMAND(command_fdcan_raw_set_safe,
+             "fdcan_raw_set_safe oid=%c id=%u flags=%c data=%*s");
+
 void
 command_fdcan_raw_query(uint32_t *args)
 {
     if (!fdr.configured || args[0] != fdr.oid)
         return;
     sendf("fdcan_raw_status oid=%c psr=%u ecr=%u rx_overflow=%u"
-          " tx_overflow=%u bad_cmd=%u wd_trips=%u bus_off=%c"
+          " tx_overflow=%u bad_cmd=%u wd_trips=%u safe_sends=%u bus_off=%c"
           , fdr.oid, FDCAN1->PSR, FDCAN1->ECR, fdr.rx_overflow, fdr.tx_overflow
-          , fdr.bad_cmd, fdr.wd_trips, fdr.bus_off);
+          , fdr.bad_cmd, fdr.wd_trips, fdr.safe_sends, fdr.bus_off);
 }
 DECL_COMMAND(command_fdcan_raw_query, "fdcan_raw_query oid=%c");
 
@@ -409,11 +471,18 @@ fdcan_raw_shutdown(void)
 {
     if (!fdr.configured)
         return;
-    // Drop off the bus: no frame (heartbeat, bed target) can leave a
-    // shut-down MCU.
-    fdr_bus_off();
+    // Timers were reset: nothing but the safe frame leaves a shut-down MCU,
+    // then it drops off the bus.
     fdr.wd_armed = 0;
-    fdr.stage_len = 0;
+    fdr.stage_len = fdr.safe_stage_len = 0;
     fdr.pace_active = 0;
+    if (!fdr.safe.len || fdr.bus_off) {
+        fdr_bus_off();
+        return;
+    }
+    fdr_send_safe();
+    fdr.close_timer.func = fdr_close_event;
+    fdr.close_timer.waketime = timer_read_time() + timer_from_us(FDR_CLOSE_US);
+    sched_add_timer(&fdr.close_timer);
 }
 DECL_SHUTDOWN(fdcan_raw_shutdown);

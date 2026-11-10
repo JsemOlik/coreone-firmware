@@ -345,7 +345,7 @@ class ACController:
         self.pins = (rx['pin'], tx['pin'], en['pin'], en['invert'])
         self.oid = self.mcu.create_oid()
         self.cmd_queue = self.mcu.alloc_command_queue()
-        self.tx_cmd = self.query_cmd = None
+        self.tx_cmd = self.query_cmd = self.safe_cmd = None
         self.mcu.register_config_callback(self._build_config)
         # Safety / behaviour
         self.status_timeout = config.getfloat('status_timeout', 5., above=1.)
@@ -407,6 +407,8 @@ class ACController:
                                desc=self.cmd_SET_AC_FAN_help)
         gcode.register_command("SET_AC_LED", self.cmd_SET_AC_LED,
                                desc=self.cmd_SET_AC_LED_help)
+        gcode.register_command("AC_TEST_WATCHDOG", self.cmd_AC_TEST_WATCHDOG,
+                               desc=self.cmd_AC_TEST_WATCHDOG_help)
         gcode.register_command("AC_TEST_HOST_LOSS",
                                self.cmd_AC_TEST_HOST_LOSS,
                                desc=self.cmd_AC_TEST_HOST_LOSS_help)
@@ -439,13 +441,17 @@ class ACController:
             "fdcan_raw_tx oid=%c id=%u flags=%c data=%*s", cq=self.cmd_queue)
         self.query_cmd = self.mcu.lookup_command(
             "fdcan_raw_query oid=%c", cq=self.cmd_queue)
+        self.safe_cmd = self.mcu.lookup_command(
+            "fdcan_raw_set_safe oid=%c id=%u flags=%c data=%*s",
+            cq=self.cmd_queue)
         self.mcu.register_serial_response(
             self._handle_rx_chunk,
             "fdcan_raw_rx oid=%c id=%u seq=%c flags=%c data=%*s", self.oid)
         self.mcu.register_serial_response(
             self._handle_bus_status,
             "fdcan_raw_status oid=%c psr=%u ecr=%u rx_overflow=%u"
-            " tx_overflow=%u bad_cmd=%u wd_trips=%u bus_off=%c", self.oid)
+            " tx_overflow=%u bad_cmd=%u wd_trips=%u safe_sends=%u"
+            " bus_off=%c", self.oid)
     def _handle_ready(self):
         self.timer = self.reactor.register_timer(self._tick, self.reactor.NOW)
     def _handle_shutdown(self):
@@ -457,11 +463,26 @@ class ACController:
     def _send_frame(self, can_id, data):
         if self.tx_cmd is None or self.printer.is_shutdown():
             return
+        if self.loss_test is not None and self.loss_test['silent']:
+            return
         data = bytes(data)
         for off in range(0, len(data), 32):
             chunk = data[off:off + 32]
             more = 1 if off + 32 < len(data) else 0
             self.tx_cmd.send([self.oid, can_id, more, chunk])
+    def _set_safe_frame(self, node):
+        # Bed off, everything else at stock defaults; the bridge sends it on
+        # its own if the host goes silent or the MCU shuts down
+        key = (cy.KIND_REQUEST, SRV_AC_SET_CONFIG, node)
+        frames = cy.make_frames(encode_config(), self._next_tid(key))
+        if len(frames) != 1:
+            self.printer.invoke_shutdown(
+                "ac_controller: bed-off Config must fit one frame")
+            return
+        can_id = cy.make_can_id(cy.KIND_REQUEST, SRV_AC_SET_CONFIG,
+                                MASTER_NODE_ID, node)
+        self.safe_cmd.send([self.oid, can_id, 0, frames[0]])
+        logging.info("ac_controller: bed-off frame set for node %d", node)
     def _next_tid(self, key):
         tid = self.tids.get(key, 0)
         self.tids[key] = (tid + 1) % cy.TRANSFER_ID_MOD
@@ -521,6 +542,7 @@ class ACController:
                 if info['name'] == AC_NODE_NAME:
                     self.ac_node = self.last_ac_node = x.source
                     self.config_dirty = self.led_dirty = True
+                    self._set_safe_frame(x.source)
             elif x.port_id == SRV_EXECUTE_COMMAND:
                 status = decode_execute_command_response(x.payload)
                 if status:
@@ -728,30 +750,48 @@ class ACController:
         if self.bus_status:
             b = self.bus_status
             lines.append("can psr=0x%x ecr=0x%x rx_ovf=%d tx_ovf=%d"
-                         " rx_err=%d watchdog_trips=%d bus_off=%d" % (
+                         " rx_err=%d watchdog_trips=%d bed_off_sends=%d"
+                         " bus_off=%d" % (
                              b['psr'], b['ecr'], b['rx_overflow'],
                              b['tx_overflow'], self.reasm.errors,
-                             b['wd_trips'], b['bus_off']))
+                             b['wd_trips'], b['safe_sends'], b['bus_off']))
         gcmd.respond_info("\n".join(lines))
     cmd_AC_TEST_HOST_LOSS_help = ("Stop the master heartbeat and config for a"
                                   " while and log how the AC Controller reacts")
     def cmd_AC_TEST_HOST_LOSS(self, gcmd):
         secs = gcmd.get_float('SECONDS', 20., minval=5., maxval=60.)
         if self.loss_test is not None:
-            raise gcmd.error("AC_TEST_HOST_LOSS already running")
+            raise gcmd.error("An AC test is already running")
         if self.ac_node is None:
             raise gcmd.error("AC Controller not found")
         now = self.reactor.monotonic()
         self.loss_test = {'start': now, 'end': now + secs, 'events': [],
-                          'last': None}
+                          'last': None, 'silent': False}
         gcmd.respond_info("Master heartbeat and config paused for %.0fs"
                           % (secs,))
+    cmd_AC_TEST_WATCHDOG_help = ("Stop all CAN transmits so the bridge watchdog"
+                                 " trips, and log how the AC Controller reacts")
+    def cmd_AC_TEST_WATCHDOG(self, gcmd):
+        secs = gcmd.get_float('SECONDS', 10., minval=self.host_timeout + 2.,
+                              maxval=60.)
+        if self.loss_test is not None:
+            raise gcmd.error("An AC test is already running")
+        if self.ac_node is None:
+            raise gcmd.error("AC Controller not found")
+        now = self.reactor.monotonic()
+        self.loss_test = {'start': now, 'end': now + secs, 'events': [],
+                          'last': None, 'silent': True,
+                          'trips': self.bus_status.get('wd_trips', 0),
+                          'sends': self.bus_status.get('safe_sends', 0)}
+        gcmd.respond_info("All CAN transmits stopped for %.0fs; the watchdog"
+                          " should trip after %.1fs" % (secs, self.host_timeout))
     def _finish_loss_test(self, eventtime):
         test, self.loss_test = self.loss_test, None
         self.loss_grace_until = eventtime + LOSS_TEST_GRACE
         self.config_dirty = True
-        lines = ["AC_TEST_HOST_LOSS done (%.0fs). Changes seen:"
-                 % (test['end'] - test['start'],)]
+        name = "AC_TEST_WATCHDOG" if test['silent'] else "AC_TEST_HOST_LOSS"
+        lines = ["%s done (%.0fs). Changes seen:"
+                 % (name, test['end'] - test['start'])]
         for t, target, pwm, temp, mode, health, faults in test['events']:
             lines.append("  +%.1fs target=%s pwm=%.2f bed=%.1fC mode=%s"
                          " health=%s faults=%s" % (
@@ -759,6 +799,13 @@ class ACController:
                              health, ",".join(fault_names(faults)) or 'none'))
         if not test['events']:
             lines.append("  no status received")
+        if test['silent']:
+            b = self.bus_status
+            lines.append("watchdog trips +%d, bed-off sends +%d" % (
+                b.get('wd_trips', 0) - test['trips'],
+                b.get('safe_sends', 0) - test['sends']))
+            # Leave the bed off rather than resume the old target
+            self.heater.set_temp(0.)
         logging.info("ac_controller: %s", "\n".join(lines))
         self.printer.lookup_object('gcode').respond_info("\n".join(lines))
     cmd_SET_AC_FAN_help = "Set AC Controller fan: FAN=bed|psu SPEED=0..1|auto"
