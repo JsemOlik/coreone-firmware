@@ -50,13 +50,15 @@ MODE_NAMES = {0: 'operational', 1: 'initialization', 2: 'maintenance',
               3: 'software_update'}
 
 CMD_START_APP = 0           # prusa3d.common.CustomExecuteCommand
+CMD_RESTART = 65535         # uavcan.node.ExecuteCommand COMMAND_RESTART
 
 HEARTBEAT_PERIOD = 1.
 HEARTBEAT_OFFLINE = 3.
-# AC_TEST_HOST_LOSS: HEARTBEAT_MISSING and DATA_TIMEOUT are expected, and
-# get this long to clear once the host is back
-LOSS_TEST_FAULTS = (1 << 30) | (1 << 29)
-LOSS_TEST_GRACE = 10.
+# HEARTBEAT_MISSING and DATA_TIMEOUT: the AC Controller lost the master. Its
+# faults latch until it reboots, so with the bed off they are cleared by
+# restarting it (at most once per LINK_RESTART_RETRY seconds).
+LINK_FAULTS = (1 << 30) | (1 << 29)
+LINK_RESTART_RETRY = 15.
 
 # prusa3d.ac_controller.Status.1.0 FAULT_* and SharedFault bits
 FAULT_NAMES = {
@@ -280,6 +282,10 @@ class RemoteHeater:
                 raise self.printer.command_error(
                     "%s: no valid temperature from the AC Controller"
                     % (self.name,))
+            if degrees and self.acc.link_faulted():
+                raise self.printer.command_error(
+                    "%s: AC Controller is recovering from a lost connection;"
+                    " try again in a few seconds" % (self.name,))
             if degrees and not self.target_temp:
                 self.target_since = now
             self.target_temp = degrees
@@ -413,7 +419,7 @@ class ACController:
                                self.cmd_AC_TEST_HOST_LOSS,
                                desc=self.cmd_AC_TEST_HOST_LOSS_help)
         self.loss_test = None
-        self.loss_grace_until = 0.
+        self.last_link_restart = -LINK_RESTART_RETRY
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
@@ -602,13 +608,18 @@ class ACController:
         self.status_raw = bytes(x.payload)
         self.last_status_time = eventtime
         faults = st['faults'] & ~self.ignore_mask
-        if self.loss_test is not None or eventtime < self.loss_grace_until:
-            # The host-loss test provokes these on purpose
-            faults &= ~LOSS_TEST_FAULTS
-        if faults:
+        if faults & ~LINK_FAULTS:
             self.printer.invoke_shutdown("AC Controller fault: %s" % (
                 ", ".join(fault_names(faults)),))
             return
+        if faults and self.loss_test is None:
+            # (the AC tests provoke these on purpose)
+            if self.heater.get_target():
+                self.printer.invoke_shutdown(
+                    "AC Controller lost contact with Klipper while heating"
+                    " (%s)" % (", ".join(fault_names(faults)),))
+                return
+            self._clear_link_faults(eventtime, x.source, faults)
         temp = st['bed_temp']
         if not math.isfinite(temp):
             # No reading yet (or a bad sensor). Harmless while the bed is
@@ -643,6 +654,18 @@ class ACController:
         if (want is None) != (have is None) or (
                 want is not None and abs(want - have) > .05):
             self.config_dirty = True
+    def link_faulted(self):
+        return bool(self.status.get('faults', 0) & LINK_FAULTS)
+    def _clear_link_faults(self, eventtime, node, faults):
+        if eventtime - self.last_link_restart < LINK_RESTART_RETRY:
+            return
+        self.last_link_restart = eventtime
+        msg = ("AC Controller reports %s (latched after a lost connection);"
+               " restarting it to clear" % (", ".join(fault_names(faults)),))
+        logging.info("ac_controller: %s", msg)
+        self.printer.lookup_object('gcode').respond_info(msg)
+        self._send_transfer(cy.KIND_REQUEST, SRV_EXECUTE_COMMAND,
+                            encode_execute_command(CMD_RESTART), dest=node)
     # Periodic work
     def request_config_update(self):
         self.config_dirty = True
@@ -787,7 +810,9 @@ class ACController:
                           " should trip after %.1fs" % (secs, self.host_timeout))
     def _finish_loss_test(self, eventtime):
         test, self.loss_test = self.loss_test, None
-        self.loss_grace_until = eventtime + LOSS_TEST_GRACE
+        # Leave the bed off rather than resume the old target; this also
+        # lets the latched link faults be cleared by restarting the AC
+        self.heater.set_temp(0.)
         self.config_dirty = True
         name = "AC_TEST_WATCHDOG" if test['silent'] else "AC_TEST_HOST_LOSS"
         lines = ["%s done (%.0fs). Changes seen:"
@@ -804,8 +829,7 @@ class ACController:
             lines.append("watchdog trips +%d, bed-off sends +%d" % (
                 b.get('wd_trips', 0) - test['trips'],
                 b.get('safe_sends', 0) - test['sends']))
-            # Leave the bed off rather than resume the old target
-            self.heater.set_temp(0.)
+        lines.append("Bed target is now 0.")
         logging.info("ac_controller: %s", "\n".join(lines))
         self.printer.lookup_object('gcode').respond_info("\n".join(lines))
     cmd_SET_AC_FAN_help = "Set AC Controller fan: FAN=bed|psu SPEED=0..1|auto"

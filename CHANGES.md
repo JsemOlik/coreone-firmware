@@ -773,7 +773,7 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   second Klipper MCU on its own USB); TCA6408A I/O expander. — 2026-06
 
 - **CORE One L mains bed: AC Controller over Cyphal/CAN FD** — ⚠ **PARTLY VALIDATED ON HARDWARE**
-  (node allocation, status, 35 °C heating; bed-off safety frame pending).
+  (node allocation, status, 35 °C heating, watchdog bed-off frame; shutdown path pending).
   `src/stm32/fdcan_raw.c` (H503 only): a raw CAN FD frame bridge on FDCAN1 (PB5/PB6, 125 kbit/s
   nominal, no BRS, timing from Buddy `hal_pub.cpp`), host-paced 1 frame/ms, drops off the bus on MCU
   shutdown. `klippy/extras/cyphal_can.py`: minimal Cyphal/CAN transport (framing, CRC, reassembly)
@@ -794,7 +794,13 @@ copyright notices and per-file license headers are **retained unchanged**; the l
     `AC_TEST_HOST_LOSS` / `AC_TEST_WATCHDOG` exercise both paths on the printer. Verified by
     compiling the real `fdcan_raw.c` against stub hardware on the host (timeout, wrap-around,
     transfer-ID rotation, shutdown sequencing, frame validation; 8/8 mutations caught) and in the
-    simulated bus. — 2026-11-10
+    simulated bus. Watchdog path confirmed on the printer (bed target cleared, PWM 0 within
+    ~3 s). — 2026-11-10
+  - **Latched link faults.** The AC Controller's faults latch until it reboots (Buddy
+    `cyphal_node.hpp` `set_fault`). `HEARTBEAT_MISSING` / `DATA_TIMEOUT` with the bed off now
+    restart the AC Controller (`ExecuteCommand` 65535, at most every 15 s) instead of shutting
+    Klipper down; with a bed target set they still shut down, and new bed targets are refused
+    until the fault clears. Both AC tests leave the bed target at 0. — 2026-11-11
 - **CORE One L BBF** — `pack-bbf.sh` / `verify-bbf.py` take `PRINTER=coreonel` (printer type 8);
   the Core One (type 7) stays the default. — 2026-11-10
 - `phase_exec` now refuses a stepper not at `microsteps: 16` (the MCU phase frame assumes 16). —
