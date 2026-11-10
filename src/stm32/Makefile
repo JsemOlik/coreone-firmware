@@ -133,3 +133,6 @@ src-$(CONFIG_MACH_STM32F427) += stm32/sg_endstop.c
 
 # StallGuard crash detection — added by klipper-port overlay
 src-$(CONFIG_MACH_STM32F427) += stm32/crash_detect.c
+
+# Raw CAN FD frame bridge (Core One L AC Controller bus on the H503)
+src-$(CONFIG_MACH_STM32H5) += stm32/fdcan_raw.c

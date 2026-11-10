@@ -724,6 +724,12 @@ copyright notices and per-file license headers are **retained unchanged**; the l
     no gate (nothing references it). Clears the Pi's last held-dirty file so Moonraker `is_valid` returns to
     True. — 2026-10-18
 
+- **CORE One L: `axes_rotation` for `[lis2dw]`/`[lis3dh]`** (`klippy/extras/lis2dw.py`) — an
+  in-plane rotation applied after `axes_map`, for the L's permanently mounted, diagonally oriented
+  LIS2DH12 (`axes_map: -y, x, z` + `axes_rotation: -45` reproduces Buddy's `to_printer_coords`).
+  Default 0 = upstream behaviour. Unit-checked against Buddy's formula; ⚠ direction NOT yet verified
+  on hardware. — 2026-11-10
+
 ## Peripherals
 - ILI9488 colour TFT display type (SPI6 TX-DMA). — 2026-06
   - **MCU-side glyph expansion (reflash-required).** The host used to render each character cell to pixels
@@ -765,6 +771,22 @@ copyright notices and per-file license headers are **retained unchanged**; the l
     2026-11-10
 - PuppyBus RS-485 master, used to *flash* the H503 enclosure MCU (at runtime the H503 is a
   second Klipper MCU on its own USB); TCA6408A I/O expander. — 2026-06
+
+- **CORE One L mains bed: AC Controller over Cyphal/CAN FD** — ⚠ **UNVALIDATED ON HARDWARE.**
+  `src/stm32/fdcan_raw.c` (H503 only): a raw CAN FD frame bridge on FDCAN1 (PB5/PB6, 125 kbit/s
+  nominal, no BRS, timing from Buddy `hal_pub.cpp`), host-paced 1 frame/ms, drops off the bus on MCU
+  shutdown. `klippy/extras/cyphal_can.py`: minimal Cyphal/CAN transport (framing, CRC, reassembly)
+  + DSDL bit codec. `klippy/extras/ac_controller.py`: Cyphal master (node 0) — PnP 2.0 allocation,
+  1 Hz heartbeat, GetInfo, `start_app` on BootCancelled (no AC firmware verify/flash: the stock AC
+  firmware is kept), `prusa3d.ac_controller.Config`/`Status`, bed LED strip; exposes the bed as a
+  remote `heater_bed` (M140/M190/TEMPERATURE_WAIT; regulation stays on the AC Controller) and turns
+  AC faults, status timeout and implausible temperatures into a Klipper shutdown. Codecs and framing
+  cross-checked byte-for-byte against pycyphal/nunavut compiled from Prusa's DSDL; node state machine
+  exercised in a simulated bus. — 2026-11-10
+- **CORE One L BBF** — `pack-bbf.sh` / `verify-bbf.py` take `PRINTER=coreonel` (printer type 8);
+  the Core One (type 7) stays the default. — 2026-11-10
+- `phase_exec` now refuses a stepper not at `microsteps: 16` (the MCU phase frame assumes 16). —
+  2026-11-10
 
 ## Build / tooling
 - `coreone/` reproducible build + flash tooling (SWD / DFU / BBF / RS-485); Kconfig/Makefile wiring. — 2026-06
