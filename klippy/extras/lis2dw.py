@@ -4,7 +4,7 @@
 # Copyright (C) 2020-2023  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging
+import logging, math
 from . import bus, adxl345, bulk_sensor
 
 # LIS2DW registers
@@ -59,6 +59,11 @@ class LIS2DW:
             self.axes_map = adxl345.read_axes_map(config, LIS3DH_SCALE,
                             LIS3DH_SCALE, LIS3DH_SCALE)
             self.data_rate = 1344
+        # Optional rotation about Z (degrees, applied after axes_map) for
+        # chips mounted diagonally to the printer axes (e.g. Core One L head)
+        rot = math.radians(config.getfloat('axes_rotation', 0.,
+                                           minval=-360., maxval=360.))
+        self.rot_cos, self.rot_sin = math.cos(rot), math.sin(rot)
         # Check for spi or i2c
         if config.get('cs_pin', None) is not None:
             self.bus_type = SPI_SERIAL_TYPE
@@ -127,8 +132,10 @@ class LIS2DW:
         count = 0
         for ptime, rx, ry, rz in samples:
             raw_xyz = (rx, ry, rz)
-            x = round(raw_xyz[x_pos] * x_scale, 6)
-            y = round(raw_xyz[y_pos] * y_scale, 6)
+            mx = raw_xyz[x_pos] * x_scale
+            my = raw_xyz[y_pos] * y_scale
+            x = round(mx * self.rot_cos - my * self.rot_sin, 6)
+            y = round(mx * self.rot_sin + my * self.rot_cos, 6)
             z = round(raw_xyz[z_pos] * z_scale, 6)
             samples[count] = (round(ptime, 6), x, y, z)
             count += 1

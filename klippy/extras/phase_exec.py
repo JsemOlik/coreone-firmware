@@ -99,6 +99,13 @@ class PhaseExec:
         self.printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.stepper_name = config.get('stepper', self.name)
+        # The MCU executor's frame is 64 step-units per electrical period
+        # (4 full steps x 16 usteps). That holds for 0.9 and 1.8 deg motors
+        # alike, but only at 16 microsteps.
+        sconfig = config.getsection(self.stepper_name)
+        if sconfig.getint('microsteps', None, note_valid=False) != 16:
+            raise config.error("phase_exec %s requires microsteps: 16 on [%s]"
+                               % (self.name, self.stepper_name))
         self.use_dma = config.getboolean('dma', False)
         self.oid = self.dma_oid = self.mcu = self.spi_oid = None
         self.mcu_stepper = None

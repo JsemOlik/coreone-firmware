@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Verify a Core One Klipper BBF is contract-valid + Prusa-bootloader-installable.
+# Verify a Core One / Core One L Klipper BBF is contract-valid + Prusa-bootloader-installable.
 # Catches silent breakage (wrong vector base, stale SHA, wrong printer type) before
 # you waste a flash cycle. Run standalone or via pack-bbf.sh's self-verify gate.
 #
@@ -12,8 +12,10 @@ import sys, hashlib, struct
 
 SIG, SHA, HDR = 64, 32, 480
 HDR_OFF, FW_OFF = SIG + SHA, SIG + SHA + HDR
+PRINTERS = {'coreone': (7, 'COREONE'), 'coreonel': (8, 'COREONEL')}
 
-def main(path):
+def main(path, printer='coreone'):
+    want_type, name = PRINTERS[printer]
     bbf = open(path, 'rb').read()
     if len(bbf) < FW_OFF + 8:
         print("BBF too small"); return 1
@@ -27,7 +29,7 @@ def main(path):
     msp, rst = struct.unpack('<II', fw[:8]) if len(fw) >= 8 else (0, 0)
 
     checks = [
-        ("printer_type == 7 (COREONE)",        ptype == 7),
+        (f"printer_type == {want_type} ({name})", ptype == want_type),
         ("bbf_version == 2",                    bbfver == 2),
         ("fw_len within file & non-empty",      0 < fw_len and FW_OFF + fw_len <= len(bbf)),
         ("descriptor SHA == sha256(hdr+fw)",    sha_emb == sha_calc),
@@ -40,12 +42,17 @@ def main(path):
     if bad:
         print("BBF INVALID ->", ", ".join(bad)); return 1
     signed = set(sig) != {0}
-    print(f"BBF OK: COREONE v{pver}.{psub}, firmware {fw_len} B @0x08020200, "
+    print(f"BBF OK: {name} v{pver}.{psub}, firmware {fw_len} B @0x08020200, "
           f"{'SIGNED' if signed else 'unsigned (dev, bootloader-accepted)'}, "
           f"sha256(hdr+fw)={sha_emb.hex()[:16]}…")
     return 0
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: verify-bbf.py <file.bbf>"); sys.exit(2)
-    sys.exit(main(sys.argv[1]))
+    args = sys.argv[1:]
+    printer = 'coreone'
+    if len(args) == 3 and args[0] == '--printer' and args[1] in PRINTERS:
+        printer, args = args[1], args[2:]
+    if len(args) != 1:
+        print("usage: verify-bbf.py [--printer coreone|coreonel] <file.bbf>")
+        sys.exit(2)
+    sys.exit(main(args[0], printer))

@@ -1896,6 +1896,10 @@ Support for LIS2DW accelerometers.
 #   above parameters. The default "i2c_speed" is 400000.
 #axes_map: x, y, z
 #   See the "adxl345" section for information on this parameter.
+#axes_rotation: 0
+#   Rotation (in degrees, counter-clockwise about Z) applied to the X
+#   and Y readings after axes_map. Use for a chip mounted diagonally
+#   to the printer axes. The default is 0.
 ```
 
 ### [lis3dh]
@@ -1927,6 +1931,10 @@ Support for LIS3DH accelerometers.
 #   above parameters. The default "i2c_speed" is 400000.
 #axes_map: x, y, z
 #   See the "adxl345" section for information on this parameter.
+#axes_rotation: 0
+#   Rotation (in degrees, counter-clockwise about Z) applied to the X
+#   and Y readings after axes_map. Use for a chip mounted diagonally
+#   to the printer axes. The default is 0.
 ```
 
 ### [bmi160]
