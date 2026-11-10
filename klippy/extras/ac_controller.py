@@ -632,7 +632,7 @@ class ACController:
                     % (self.heater.get_target(),))
                 return self.reactor.NEVER
         # Config / LEDs
-        if self.ac_node is not None and self._ac_operational():
+        if self.ac_node is not None and self._ac_app_running():
             if self.config_dirty and (
                     eventtime - self.last_config_time >= .2):
                 self._send_config(eventtime)
@@ -644,6 +644,11 @@ class ACController:
                                     encode_leds(mode, rgbw, progress))
                 self.led_dirty = False
         return eventtime + .2
+    def _ac_app_running(self):
+        # Stock firmware configures the node in initialization mode too
+        node = self.nodes.get(self.ac_node)
+        return bool(node and node.get('hb') and node['hb']['mode'] in (
+            MODE_OPERATIONAL, MODE_INITIALIZATION))
     def _ac_operational(self):
         node = self.nodes.get(self.ac_node)
         return bool(node and node.get('hb')
