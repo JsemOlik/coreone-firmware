@@ -129,6 +129,12 @@ def decode_record(data):
     text = r.align().raw(r.uint(8))
     return severity, text.decode('utf-8', 'replace')
 
+def encode_record(text, severity=2):
+    """uavcan.diagnostic.Record.1.1 (timestamp unknown)"""
+    text = text.encode('utf-8')[:255]
+    w = cy.BitWriter().uint(0, 56).uint(severity, 8).uint(len(text), 8)
+    return w.raw(text).bytes()
+
 def _w_target_temp(w, temp):
     w.align()
     if temp is None:
@@ -397,6 +403,10 @@ class ACController:
                                desc=self.cmd_SET_AC_FAN_help)
         gcode.register_command("SET_AC_LED", self.cmd_SET_AC_LED,
                                desc=self.cmd_SET_AC_LED_help)
+        gcode.register_command("AC_TEST_HOST_LOSS",
+                               self.cmd_AC_TEST_HOST_LOSS,
+                               desc=self.cmd_AC_TEST_HOST_LOSS_help)
+        self.loss_test = None
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
@@ -587,6 +597,16 @@ class ACController:
                 "AC Controller bed temperature %.1f out of range" % (temp,))
             return
         self.heater.update(eventtime, temp, st['bed_pwm'])
+        test = self.loss_test
+        if test is not None:
+            node = self.nodes.get(x.source, {}).get('hb') or {}
+            key = (st['bed_target'], st['bed_pwm'] > 0., node.get('mode'),
+                   node.get('health'))
+            if key != test['last']:
+                test['last'] = key
+                test['events'].append((eventtime - test['start'], st['bed_target'],
+                                       st['bed_pwm'], temp, node.get('mode'),
+                                       node.get('health')))
         want = self.heater.get_target() or None
         have = st['bed_target']
         if (want is None) != (have is None) or (
@@ -609,12 +629,21 @@ class ACController:
     def _tick(self, eventtime):
         if self.printer.is_shutdown():
             return self.reactor.NEVER
+        test = self.loss_test
+        if test is not None and eventtime >= test['end']:
+            self._finish_loss_test(eventtime)
+            test = None
         # Master heartbeat
         if eventtime - self.last_hb >= HEARTBEAT_PERIOD:
             self.last_hb = eventtime
-            uptime = int(eventtime - self.uptime_start)
-            self._send_transfer(cy.KIND_MESSAGE, PORT_HEARTBEAT,
-                                encode_heartbeat(uptime))
+            if test is None:
+                uptime = int(eventtime - self.uptime_start)
+                self._send_transfer(cy.KIND_MESSAGE, PORT_HEARTBEAT,
+                                    encode_heartbeat(uptime))
+            else:
+                # Keep the bridge watchdog fed without a master heartbeat
+                self._send_transfer(cy.KIND_MESSAGE, PORT_RECORD,
+                                    encode_record("host-loss test"))
             self.query_cmd.send([self.oid])
         # Node liveness
         if self.ac_node is not None:
@@ -632,7 +661,8 @@ class ACController:
                     % (self.heater.get_target(),))
                 return self.reactor.NEVER
         # Config / LEDs
-        if self.ac_node is not None and self._ac_app_running():
+        if (test is None and self.ac_node is not None
+                and self._ac_app_running()):
             if self.config_dirty and (
                     eventtime - self.last_config_time >= .2):
                 self._send_config(eventtime)
@@ -694,6 +724,32 @@ class ACController:
                              b['tx_overflow'], self.reasm.errors,
                              b['wd_trips'], b['bus_off']))
         gcmd.respond_info("\n".join(lines))
+    cmd_AC_TEST_HOST_LOSS_help = ("Stop the master heartbeat and config for a"
+                                  " while and log how the AC Controller reacts")
+    def cmd_AC_TEST_HOST_LOSS(self, gcmd):
+        secs = gcmd.get_float('SECONDS', 20., minval=5., maxval=60.)
+        if self.loss_test is not None:
+            raise gcmd.error("AC_TEST_HOST_LOSS already running")
+        if self.ac_node is None:
+            raise gcmd.error("AC Controller not found")
+        now = self.reactor.monotonic()
+        self.loss_test = {'start': now, 'end': now + secs, 'events': [],
+                          'last': None}
+        gcmd.respond_info("Master heartbeat and config paused for %.0fs"
+                          % (secs,))
+    def _finish_loss_test(self, eventtime):
+        test, self.loss_test = self.loss_test, None
+        self.config_dirty = True
+        lines = ["AC_TEST_HOST_LOSS done (%.0fs). Changes seen:"
+                 % (test['end'] - test['start'],)]
+        for t, target, pwm, temp, mode, health in test['events']:
+            lines.append("  +%.1fs target=%s pwm=%.2f bed=%.1fC mode=%s"
+                         " health=%s" % (t, target, pwm, temp,
+                                         MODE_NAMES.get(mode, mode), health))
+        if not test['events']:
+            lines.append("  no status received")
+        logging.info("ac_controller: %s", "\n".join(lines))
+        self.printer.lookup_object('gcode').respond_info("\n".join(lines))
     cmd_SET_AC_FAN_help = "Set AC Controller fan: FAN=bed|psu SPEED=0..1|auto"
     def cmd_SET_AC_FAN(self, gcmd):
         fan = gcmd.get('FAN').lower()
