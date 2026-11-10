@@ -772,7 +772,8 @@ copyright notices and per-file license headers are **retained unchanged**; the l
 - PuppyBus RS-485 master, used to *flash* the H503 enclosure MCU (at runtime the H503 is a
   second Klipper MCU on its own USB); TCA6408A I/O expander. — 2026-06
 
-- **CORE One L mains bed: AC Controller over Cyphal/CAN FD** — ⚠ **UNVALIDATED ON HARDWARE.**
+- **CORE One L mains bed: AC Controller over Cyphal/CAN FD** — ⚠ **PARTLY VALIDATED ON HARDWARE**
+  (node allocation, status, 35 °C heating; bed-off safety frame pending).
   `src/stm32/fdcan_raw.c` (H503 only): a raw CAN FD frame bridge on FDCAN1 (PB5/PB6, 125 kbit/s
   nominal, no BRS, timing from Buddy `hal_pub.cpp`), host-paced 1 frame/ms, drops off the bus on MCU
   shutdown. `klippy/extras/cyphal_can.py`: minimal Cyphal/CAN transport (framing, CRC, reassembly)
@@ -783,12 +784,17 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   AC faults, status timeout and implausible temperatures into a Klipper shutdown. Codecs and framing
   cross-checked byte-for-byte against pycyphal/nunavut compiled from Prusa's DSDL; node state machine
   exercised in a simulated bus. — 2026-11-10
-  - **H503 host watchdog** (`fdcan_raw.c`, `host_timeout`, default 3 s): a dead or hung host never
-    sends a shutdown, so the bridge itself takes the bus down (cancels pending frames, releases
-    ENABLE) when no frame arrives from the host in time; only a fresh transmit from a live host
-    restores it, with stale hardware buffers cancelled first. Not an MCU shutdown, so a host-only
-    `RESTART` recovers. Verified by compiling the real `fdcan_raw.c` against stub hardware on the
-    host (timeout, wrap-around, recovery, shutdown, config limit; 7/7 mutations caught). — 2026-11-10
+  - **H503 host watchdog and bed-off frame** (`fdcan_raw.c`, `host_timeout`, default 3 s). On
+    hardware the AC Controller keeps heating to its last target when the master heartbeat stops
+    (it only raises `HEARTBEAT_MISSING`), so silence alone is not safe. The host hands the bridge
+    a ready-made single-frame `Config` with the bed off (`fdcan_raw_set_safe`); the bridge sends
+    it three times with consecutive transfer IDs, replacing queued host frames, when no frame
+    arrives from the host in time (the bus stays up; not an MCU shutdown, so a host-only `RESTART`
+    recovers) and on MCU shutdown (then leaves the bus and releases ENABLE 100 ms later).
+    `AC_TEST_HOST_LOSS` / `AC_TEST_WATCHDOG` exercise both paths on the printer. Verified by
+    compiling the real `fdcan_raw.c` against stub hardware on the host (timeout, wrap-around,
+    transfer-ID rotation, shutdown sequencing, frame validation; 8/8 mutations caught) and in the
+    simulated bus. — 2026-11-10
 - **CORE One L BBF** — `pack-bbf.sh` / `verify-bbf.py` take `PRINTER=coreonel` (printer type 8);
   the Core One (type 7) stays the default. — 2026-11-10
 - `phase_exec` now refuses a stepper not at `microsteps: 16` (the MCU phase frame assumes 16). —
