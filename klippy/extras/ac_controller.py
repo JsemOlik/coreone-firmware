@@ -264,9 +264,14 @@ class RemoteHeater:
             raise self.printer.command_error(
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
+        now = self.printer.get_reactor().monotonic()
         with self.lock:
+            if degrees and now - self.last_temp_time > self.acc.status_timeout:
+                raise self.printer.command_error(
+                    "%s: no valid temperature from the AC Controller"
+                    % (self.name,))
             if degrees and not self.target_temp:
-                self.target_since = self.printer.get_reactor().monotonic()
+                self.target_since = now
             self.target_temp = degrees
         self.acc.request_config_update()
     def alter_target(self, target_temp):
@@ -361,6 +366,8 @@ class ACController:
         self.ac_node = None
         self.last_ac_node = None    # kept across heartbeat loss for faults
         self.status = {}
+        self.status_raw = b''
+        self.nan_logged = False
         self.last_status_time = 0.
         self.last_config_time = 0.
         self.bus_status = {}
@@ -555,20 +562,31 @@ class ACController:
     def _on_status(self, eventtime, x):
         st = decode_status(x.payload)
         self.status = st
+        self.status_raw = bytes(x.payload)
         self.last_status_time = eventtime
-        temp = st['bed_temp']
-        if not math.isfinite(temp) or not (
-                self.heater.min_temp - 10. <= temp
-                <= self.heater.max_temp + 10.):
-            self.printer.invoke_shutdown(
-                "AC Controller bed temperature %.1f out of range" % (temp,))
-            return
-        self.heater.update(eventtime, temp, st['bed_pwm'])
         faults = st['faults'] & ~self.ignore_mask
         if faults:
             self.printer.invoke_shutdown("AC Controller fault: %s" % (
                 ", ".join(fault_names(faults)),))
             return
+        temp = st['bed_temp']
+        if not math.isfinite(temp):
+            # No reading yet (or a bad sensor). Harmless while the bed is
+            # off; heating is refused until a real temperature arrives.
+            if not self.nan_logged:
+                self.nan_logged = True
+                logging.info("ac_controller: bed temperature not available;"
+                             " status payload %s", self.status_raw.hex())
+            if self.heater.get_target():
+                self.printer.invoke_shutdown(
+                    "AC Controller bed temperature lost while heating")
+            return
+        if not (self.heater.min_temp - 10. <= temp
+                <= self.heater.max_temp + 10.):
+            self.printer.invoke_shutdown(
+                "AC Controller bed temperature %.1f out of range" % (temp,))
+            return
+        self.heater.update(eventtime, temp, st['bed_pwm'])
         want = self.heater.get_target() or None
         have = st['bed_target']
         if (want is None) != (have is None) or (
@@ -658,8 +676,11 @@ class ACController:
             lines.append("fans: bed %.0f/%.0f rpm psu %.0f rpm" % (
                 st['bed_fan0']['rpm'], st['bed_fan1']['rpm'],
                 st['psu_fan']['rpm']))
+            lines.append("board %.1fC mcu %.1fC supply %.1fV" % (
+                st['board_temp'], st['mcu_temp'], st['supply_voltage']))
             lines.append("faults: %s" % (
                 ", ".join(fault_names(st['faults'])) or 'none',))
+            lines.append("raw: %s" % (self.status_raw.hex(),))
         if self.bus_status:
             b = self.bus_status
             lines.append("can psr=0x%x ecr=0x%x rx_ovf=%d tx_ovf=%d"
@@ -696,7 +717,9 @@ class ACController:
                 self.led = ('progress', rgbw, progress)
         self.led_dirty = True
     def get_status(self, eventtime):
-        st = self.status
+        # NaN is not valid JSON; report missing readings as None
+        st = {k: (v if not isinstance(v, float) or math.isfinite(v) else None)
+              for k, v in self.status.items()}
         return {
             'node_id': self.ac_node,
             'operational': self.ac_node is not None
@@ -707,10 +730,13 @@ class ACController:
             'ac_frequency': st.get('ac_frequency', 0.),
             'psu_temp': st.get('psu_temp', 0.),
             'mcu_temp': st.get('mcu_temp', 0.),
-            'bed_fan_rpm': [st.get('bed_fan0', {}).get('rpm', 0.),
-                            st.get('bed_fan1', {}).get('rpm', 0.)],
-            'psu_fan_rpm': st.get('psu_fan', {}).get('rpm', 0.),
+            'bed_fan_rpm': [_finite(st.get('bed_fan0', {}).get('rpm', 0.)),
+                            _finite(st.get('bed_fan1', {}).get('rpm', 0.))],
+            'psu_fan_rpm': _finite(st.get('psu_fan', {}).get('rpm', 0.)),
         }
+
+def _finite(v):
+    return v if v is None or math.isfinite(v) else None
 
 def load_config(config):
     return ACController(config)
