@@ -17,6 +17,8 @@
 # and runaway protection), so the heater only forwards the target. Klipper
 # adds: fault, status timeout and out-of-range temperature -> shutdown.
 # On any shutdown the H503 drops off the bus, so heartbeat and targets stop.
+# If the host itself dies (no shutdown is ever sent), the H503's watchdog
+# takes the bus down after host_timeout seconds without a frame to send.
 #
 # Protocol reference: Prusa-Firmware-Buddy src/puppy/xbuddy_extension/
 # (cyphal_*.cpp) and src/can/data_types/ (DSDL).
@@ -333,6 +335,9 @@ class ACController:
         # Safety / behaviour
         self.status_timeout = config.getfloat('status_timeout', 5., above=1.)
         self.config_refresh = config.getfloat('config_refresh', 2., above=.2)
+        # MCU-side: bus goes down if the host sends nothing for this long
+        self.host_timeout = config.getfloat('host_timeout', 3.,
+                                            minval=1.5, maxval=8.)
         ignore = config.getlist('ignore_faults', [])
         self.ignore_mask = 0
         for f in ignore:
@@ -406,7 +411,8 @@ class ACController:
         rx, tx, en, inv = self.pins
         self.mcu.add_config_cmd(
             "config_fdcan_raw oid=%d rx_pin=%s tx_pin=%s enable_pin=%s"
-            " enable_invert=%d" % (self.oid, rx, tx, en, inv))
+            " enable_invert=%d watchdog_ms=%d"
+            % (self.oid, rx, tx, en, inv, int(self.host_timeout * 1000.)))
         self.tx_cmd = self.mcu.lookup_command(
             "fdcan_raw_tx oid=%c id=%u flags=%c data=%*s", cq=self.cmd_queue)
         self.query_cmd = self.mcu.lookup_command(
@@ -417,7 +423,7 @@ class ACController:
         self.mcu.register_serial_response(
             self._handle_bus_status,
             "fdcan_raw_status oid=%c psr=%u ecr=%u rx_overflow=%u"
-            " tx_overflow=%u bad_cmd=%u", self.oid)
+            " tx_overflow=%u bad_cmd=%u wd_trips=%u bus_off=%c", self.oid)
     def _handle_ready(self):
         self.timer = self.reactor.register_timer(self._tick, self.reactor.NOW)
     def _handle_shutdown(self):
@@ -657,9 +663,10 @@ class ACController:
         if self.bus_status:
             b = self.bus_status
             lines.append("can psr=0x%x ecr=0x%x rx_ovf=%d tx_ovf=%d"
-                         " rx_err=%d" % (b['psr'], b['ecr'],
-                                         b['rx_overflow'], b['tx_overflow'],
-                                         self.reasm.errors))
+                         " rx_err=%d watchdog_trips=%d bus_off=%d" % (
+                             b['psr'], b['ecr'], b['rx_overflow'],
+                             b['tx_overflow'], self.reasm.errors,
+                             b['wd_trips'], b['bus_off']))
         gcmd.respond_info("\n".join(lines))
     cmd_SET_AC_FAN_help = "Set AC Controller fan: FAN=bed|psu SPEED=0..1|auto"
     def cmd_SET_AC_FAN(self, gcmd):

@@ -783,6 +783,12 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   AC faults, status timeout and implausible temperatures into a Klipper shutdown. Codecs and framing
   cross-checked byte-for-byte against pycyphal/nunavut compiled from Prusa's DSDL; node state machine
   exercised in a simulated bus. — 2026-11-10
+  - **H503 host watchdog** (`fdcan_raw.c`, `host_timeout`, default 3 s): a dead or hung host never
+    sends a shutdown, so the bridge itself takes the bus down (cancels pending frames, releases
+    ENABLE) when no frame arrives from the host in time; only a fresh transmit from a live host
+    restores it, with stale hardware buffers cancelled first. Not an MCU shutdown, so a host-only
+    `RESTART` recovers. Verified by compiling the real `fdcan_raw.c` against stub hardware on the
+    host (timeout, wrap-around, recovery, shutdown, config limit; 7/7 mutations caught). — 2026-11-10
 - **CORE One L BBF** — `pack-bbf.sh` / `verify-bbf.py` take `PRINTER=coreonel` (printer type 8);
   the Core One (type 7) stays the default. — 2026-11-10
 - `phase_exec` now refuses a stepper not at `microsteps: 16` (the MCU phase frame assumes 16). —

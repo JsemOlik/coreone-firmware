@@ -6,9 +6,14 @@
 // all of Cyphal (framing, CRC, node allocation, heartbeat, DSDL).
 //
 // Safety model: the master heartbeat and every bed target come from the host.
-// If the host stops, no heartbeat is sent and the AC Controller times out. On
-// MCU shutdown the controller is forced into INIT (off the bus) and the bus
+// On MCU shutdown the controller is forced into INIT (off the bus) and the bus
 // enable line is released, so a shut-down MCU can never keep the bus alive.
+// A host watchdog covers a dead or hung host (which never sends a shutdown):
+// once armed by the first transmit, if no fdcan_raw_tx arrives within
+// watchdog_ms the bus is taken down the same way, pending frames are dropped,
+// and only a fresh transmit from a live host brings it back. It deliberately
+// does not shut the MCU down, so a host-only RESTART recovers without a
+// FIRMWARE_RESTART.
 //
 // Bus timing matches Prusa's xBuddy-extension firmware: CAN FD frames without
 // bit-rate switching at 125 kbit/s, 87.5% sample point, from a 48 MHz kernel
@@ -82,6 +87,10 @@ static struct fdr {
     struct timer pace_timer;
     uint32_t next_send;
     uint8_t pace_active, rx_seq;
+    // host watchdog
+    struct timer wd_timer;
+    uint32_t wd_ticks, wd_deadline, wd_trips;
+    uint8_t wd_armed, bus_off;
 } fdr;
 
 static struct task_wake fdr_wake;
@@ -168,6 +177,58 @@ FDCAN1_IRQHandler(void)
     FDCAN1->IR = ir & ~(FDCAN_IR_RF0N | FDCAN_IR_TFE);
 }
 
+// Take the controller off the bus and drop every pending frame
+static void
+fdr_bus_off(void)
+{
+    FDCAN1->TXBCR = 0x7;        // cancel all hardware tx buffers
+    FDCAN1->CCCR |= FDCAN_CCCR_INIT;
+    gpio_out_write(fdr.enable, !fdr.enable_on);
+    fdr.tx_head = fdr.tx_tail = 0;
+    fdr.bus_off = 1;
+}
+
+static void
+fdr_bus_on(void)
+{
+    // A frame held in hardware from before the bus went down (possibly an
+    // old bed target) must never go out after recovery.
+    FDCAN1->TXBCR = 0x7;
+    gpio_out_write(fdr.enable, fdr.enable_on);
+    FDCAN1->CCCR &= ~FDCAN_CCCR_INIT;
+    while (FDCAN1->CCCR & FDCAN_CCCR_INIT)
+        ;
+    fdr.bus_off = 0;
+}
+
+static uint_fast8_t
+fdr_wd_event(struct timer *t)
+{
+    if (timer_is_before(t->waketime, fdr.wd_deadline)) {
+        t->waketime = fdr.wd_deadline;
+        return SF_RESCHEDULE;
+    }
+    fdr_bus_off();
+    fdr.wd_armed = 0;
+    fdr.wd_trips++;
+    return SF_DONE;
+}
+
+// Called (irqs off) for every transmit from the host
+static void
+fdr_wd_feed(void)
+{
+    if (!fdr.wd_ticks)
+        return;
+    fdr.wd_deadline = timer_read_time() + fdr.wd_ticks;
+    if (fdr.wd_armed)
+        return;
+    fdr.wd_armed = 1;
+    fdr.wd_timer.func = fdr_wd_event;
+    fdr.wd_timer.waketime = fdr.wd_deadline;
+    sched_add_timer(&fdr.wd_timer);
+}
+
 static void
 fdr_hw_init(uint32_t rx_pin, uint32_t tx_pin)
 {
@@ -226,6 +287,10 @@ command_config_fdcan_raw(uint32_t *args)
         shutdown("fdcan_raw already configured");
     fdr.oid = args[0];
     fdr.enable_on = !args[4];
+    uint32_t wd_ms = args[5];
+    if (wd_ms > 8000)
+        shutdown("fdcan_raw watchdog_ms too large");
+    fdr.wd_ticks = timer_from_us(wd_ms * 1000);
     fdr.enable = gpio_out_setup(args[3], !fdr.enable_on);
     fdr_hw_init(args[1], args[2]);
     gpio_out_write(fdr.enable, fdr.enable_on);
@@ -233,7 +298,7 @@ command_config_fdcan_raw(uint32_t *args)
 }
 DECL_COMMAND(command_config_fdcan_raw,
              "config_fdcan_raw oid=%c rx_pin=%u tx_pin=%u"
-             " enable_pin=%u enable_invert=%c");
+             " enable_pin=%u enable_invert=%c watchdog_ms=%u");
 
 void
 command_fdcan_raw_tx(uint32_t *args)
@@ -259,6 +324,9 @@ command_fdcan_raw_tx(uint32_t *args)
         return;
     }
     irqstatus_t flag = irq_save();
+    fdr_wd_feed();
+    if (fdr.bus_off)
+        fdr_bus_on();
     if ((uint8_t)(fdr.tx_head - fdr.tx_tail) >= FDR_TX_RING) {
         fdr.tx_overflow++;
     } else {
@@ -280,9 +348,9 @@ command_fdcan_raw_query(uint32_t *args)
     if (!fdr.configured || args[0] != fdr.oid)
         return;
     sendf("fdcan_raw_status oid=%c psr=%u ecr=%u rx_overflow=%u"
-          " tx_overflow=%u bad_cmd=%u"
+          " tx_overflow=%u bad_cmd=%u wd_trips=%u bus_off=%c"
           , fdr.oid, FDCAN1->PSR, FDCAN1->ECR, fdr.rx_overflow, fdr.tx_overflow
-          , fdr.bad_cmd);
+          , fdr.bad_cmd, fdr.wd_trips, fdr.bus_off);
 }
 DECL_COMMAND(command_fdcan_raw_query, "fdcan_raw_query oid=%c");
 
@@ -343,9 +411,8 @@ fdcan_raw_shutdown(void)
         return;
     // Drop off the bus: no frame (heartbeat, bed target) can leave a
     // shut-down MCU.
-    FDCAN1->CCCR |= FDCAN_CCCR_INIT;
-    gpio_out_write(fdr.enable, !fdr.enable_on);
-    fdr.tx_head = fdr.tx_tail = 0;
+    fdr_bus_off();
+    fdr.wd_armed = 0;
     fdr.stage_len = 0;
     fdr.pace_active = 0;
 }
