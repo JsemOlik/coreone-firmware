@@ -58,6 +58,7 @@
 
 struct dma_seg {
     uint8_t cs, dc, len;
+    uint16_t rep;   // DMA the same bytes this many times (solid fills)
 };
 
 struct display_dma {
@@ -87,6 +88,9 @@ struct display_dma {
     // them -- the host bounds the claim. (Same class as the uint16 counter wrap.)
     volatile uint32_t last_tc;  // timer_read_time() of the last completion
     struct spi_config fast, slow; // write clock / read clock (see DD_READ_RATE)
+    // anti-aliased blit in progress (display_dma_aa)
+    uint32_t aa_left;           // pixels still to come
+    uint8_t aa_pal[16][3];      // coverage level -> panel colour
     struct dma_seg segs[NSEG];
     uint8_t data[NSEG][SEG_MAX];
 };
@@ -154,10 +158,17 @@ DMA2_Stream5_IRQHandler(void)
         while (s->CR & DMA_SxCR_EN)
             ;
         d->spi->CR2 &= ~SPI_CR2_TXDMAEN;
-        d->tail = (d->tail + 1 < NSEG) ? d->tail + 1 : 0;
-        d->count--;
         d->tc++;
         d->last_tc = timer_read_time();
+        struct dma_seg *seg = &d->segs[d->tail];
+        if (seg->rep > 1) {
+            // Repeated segment: send the same bytes again, same CS/DC
+            seg->rep--;
+            dd_start_dma(d, d->data[d->tail], seg->len);
+            return;
+        }
+        d->tail = (d->tail + 1 < NSEG) ? d->tail + 1 : 0;
+        d->count--;
         dd_process(d);
     } else {
         // Transfer/FIFO error: clear flags, drop this segment, keep going so a
@@ -193,6 +204,7 @@ command_config_display_dma(uint32_t *args)
     d->head = d->tail = d->count = 0;
     d->running = 0;
     d->tc = d->dmaerr = d->pushes = d->last_tc = 0;
+    d->aa_left = 0;
     d->maxcount = 0;
     dd_active = d;
 
@@ -235,6 +247,7 @@ command_display_dma_seg(uint32_t *args)
     d->segs[h].cs = flags & 1;
     d->segs[h].dc = (flags >> 1) & 1;
     d->segs[h].len = len;
+    d->segs[h].rep = 1;
     irq_disable();
     d->head = (h + 1 < NSEG) ? h + 1 : 0;
     d->count++;
@@ -275,9 +288,10 @@ DECL_COMMAND(command_display_dma_seg,
 
 // Enqueue one segment, copying into the ring's own data slot. Mirrors the
 // host-facing producer (same bounded ring-full spin, same irq discipline).
+// The bytes are sent rep times; a solid fill is one slot however large.
 static void
-dd_push(struct display_dma *d, uint8_t cs, uint8_t dc,
-        const uint8_t *buf, uint8_t len)
+dd_push_rep(struct display_dma *d, uint8_t cs, uint8_t dc,
+            const uint8_t *buf, uint8_t len, uint16_t rep)
 {
     uint32_t deadline = timer_read_time() + timer_from_us(DD_STALL_US);
     while (d->count >= NSEG)
@@ -289,6 +303,7 @@ dd_push(struct display_dma *d, uint8_t cs, uint8_t dc,
     d->segs[h].cs = cs;
     d->segs[h].dc = dc;
     d->segs[h].len = len;
+    d->segs[h].rep = rep;
     irq_disable();
     d->head = (h + 1 < NSEG) ? h + 1 : 0;
     d->count++;
@@ -298,6 +313,32 @@ dd_push(struct display_dma *d, uint8_t cs, uint8_t dc,
     if (!d->running)
         dd_process(d);
     irq_enable();
+}
+
+static void
+dd_push(struct display_dma *d, uint8_t cs, uint8_t dc,
+        const uint8_t *buf, uint8_t len)
+{
+    dd_push_rep(d, cs, dc, buf, len, 1);
+}
+
+// Open a CASET/RASET/RAMWR window; CS stays low until the caller raises it
+static void
+dd_window(struct display_dma *d, uint32_t x, uint32_t y,
+          uint32_t w, uint32_t h)
+{
+    uint32_t x1 = x + w - 1, y1 = y + h - 1;
+    uint8_t cmd, win[4];
+    cmd = ILI_CASET;
+    dd_push(d, 0, 0, &cmd, 1);
+    win[0] = x >> 8; win[1] = x; win[2] = x1 >> 8; win[3] = x1;
+    dd_push(d, 0, 1, win, 4);
+    cmd = ILI_RASET;
+    dd_push(d, 0, 0, &cmd, 1);
+    win[0] = y >> 8; win[1] = y; win[2] = y1 >> 8; win[3] = y1;
+    dd_push(d, 0, 1, win, 4);
+    cmd = ILI_RAMWR;
+    dd_push(d, 0, 0, &cmd, 1);
 }
 
 // Accumulate pixel bytes and emit full SEG_MAX segments, so a cell costs the
@@ -349,20 +390,7 @@ command_display_dma_glyph(uint32_t *args)
     if (blen < 16)
         shutdown("display_dma glyph bitmap too short");
 
-    uint32_t w = 8 * scale, h = 16 * scale;
-    uint32_t x1 = x + w - 1, y1 = y + h - 1;
-    uint8_t cmd, win[4];
-
-    cmd = ILI_CASET;
-    dd_push(d, 0, 0, &cmd, 1);
-    win[0] = x >> 8; win[1] = x; win[2] = x1 >> 8; win[3] = x1;
-    dd_push(d, 0, 1, win, 4);
-    cmd = ILI_RASET;
-    dd_push(d, 0, 0, &cmd, 1);
-    win[0] = y >> 8; win[1] = y; win[2] = y1 >> 8; win[3] = y1;
-    dd_push(d, 0, 1, win, 4);
-    cmd = ILI_RAMWR;
-    dd_push(d, 0, 0, &cmd, 1);
+    dd_window(d, x, y, 8 * scale, 16 * scale);
 
     uint8_t fgb[3] = { fg >> 16, fg >> 8, fg };
     uint8_t bgb[3] = { bg >> 16, bg >> 8, bg };
@@ -389,6 +417,96 @@ command_display_dma_glyph(uint32_t *args)
 DECL_COMMAND(command_display_dma_glyph,
              "display_dma_glyph oid=%c x=%u y=%u scale=%u fg=%u bg=%u"
              " bitmap=%*s");
+
+// --- graphical UI primitives -------------------------------------------------
+//
+// The ili9488 graphical UI draws solid rectangles and anti-aliased text. A fill
+// is one command and, through the segment repeat count, a handful of ring slots
+// however large it is: the DMA engine replays one 16-pixel buffer. Text comes as
+// a window (display_dma_aa) followed by run-length coded coverage
+// (display_dma_aa_data); each byte is (level << 4) | (count - 1), the level
+// blending from bg (0) to fg (15).
+
+#define FILL_PX (SEG_MAX / 3)
+
+void
+command_display_dma_fill(uint32_t *args)
+{
+    struct display_dma *d = oid_lookup(args[0], command_config_display_dma);
+    uint32_t x = args[1], y = args[2], w = args[3], h = args[4];
+    uint32_t color = args[5];
+    if (!w || !h)
+        return;
+    uint8_t buf[SEG_MAX];
+    uint32_t i;
+    for (i = 0; i < FILL_PX; i++) {
+        buf[i * 3] = color >> 16;
+        buf[i * 3 + 1] = color >> 8;
+        buf[i * 3 + 2] = color;
+    }
+    dd_window(d, x, y, w, h);
+    uint32_t n = w * h, blocks = n / FILL_PX;
+    while (blocks) {
+        uint32_t rep = blocks > 0xffff ? 0xffff : blocks;
+        dd_push_rep(d, 0, 1, buf, SEG_MAX, rep);
+        blocks -= rep;
+    }
+    if (n % FILL_PX)
+        dd_push(d, 0, 1, buf, (n % FILL_PX) * 3);
+    dd_push(d, 1, 1, NULL, 0);   // CS high
+}
+DECL_COMMAND(command_display_dma_fill,
+             "display_dma_fill oid=%c x=%u y=%u w=%u h=%u color=%u");
+
+void
+command_display_dma_aa(uint32_t *args)
+{
+    struct display_dma *d = oid_lookup(args[0], command_config_display_dma);
+    uint32_t x = args[1], y = args[2], w = args[3], h = args[4];
+    uint32_t fg = args[5], bg = args[6];
+    if (d->aa_left) {
+        // An unfinished blit (host restarted mid-way): close it
+        d->aa_left = 0;
+        dd_push(d, 1, 1, NULL, 0);
+    }
+    if (!w || !h)
+        return;
+    uint32_t i, c;
+    for (i = 0; i < 16; i++)
+        for (c = 0; c < 3; c++) {
+            int32_t f = (fg >> (16 - 8 * c)) & 0xff;
+            int32_t b = (bg >> (16 - 8 * c)) & 0xff;
+            d->aa_pal[i][c] = b + (f - b) * (int32_t)i / 15;
+        }
+    dd_window(d, x, y, w, h);
+    d->aa_left = w * h;
+}
+DECL_COMMAND(command_display_dma_aa,
+             "display_dma_aa oid=%c x=%u y=%u w=%u h=%u fg=%u bg=%u");
+
+void
+command_display_dma_aa_data(uint32_t *args)
+{
+    struct display_dma *d = oid_lookup(args[0], command_config_display_dma);
+    uint8_t len = args[1];
+    uint8_t *data = command_decode_ptr(args[2]);
+    struct dd_acc acc = { .d = d, .n = 0 };
+    uint32_t i;
+    for (i = 0; i < len && d->aa_left; i++) {
+        uint8_t *px = d->aa_pal[data[i] >> 4];
+        uint32_t count = (data[i] & 0x0f) + 1;
+        if (count > d->aa_left)
+            count = d->aa_left;
+        d->aa_left -= count;
+        while (count--)
+            dd_acc_put(&acc, px, 3);
+    }
+    dd_acc_flush(&acc);
+    if (!d->aa_left)
+        dd_push(d, 1, 1, NULL, 0);   // CS high
+}
+DECL_COMMAND(command_display_dma_aa_data,
+             "display_dma_aa_data oid=%c data=%*s");
 
 // Block until the ring has fully drained (used before any non-engine SPI6 access
 // e.g. a backlight command, so it never collides with an in-flight flush).
@@ -483,6 +601,7 @@ display_dma_shutdown(void)
     d->spi->CR2 &= ~SPI_CR2_TXDMAEN;
     d->count = d->head = d->tail = 0;
     d->running = 0;
+    d->aa_left = 0;
     gpio_out_write(d->cs, 1); // deselect the panel
 }
 DECL_SHUTDOWN(display_dma_shutdown);

@@ -338,8 +338,16 @@ class GT911Touch:
             lcd._note_activity(eventtime)
             return
         rows = max(1, menu.rows)
-        row_px = 16 * getattr(lcd, 'scale', 0) or self.height // rows
-        if kind in ('tap', 'long_press'):
+        if hasattr(lcd, 'menu_row_height'):
+            row_px = lcd.menu_row_height()
+        else:
+            row_px = 16 * getattr(lcd, 'scale', 0) or self.height // rows
+        target = None
+        if hasattr(lcd, 'touch_target'):
+            target = lcd.touch_target(pos[0], pos[1])
+        if kind in ('tap', 'long_press') and target is not None:
+            self._target_action(menu, target, kind, eventtime)
+        elif kind in ('tap', 'long_press'):
             key = 'click' if kind == 'tap' else 'long_click'
             if menu.is_running():
                 self._select_row(menu, pos[1] // row_px)
@@ -351,6 +359,32 @@ class GT911Touch:
                 menu.key_event(key, eventtime)
         elif kind == 'swipe_right' and menu.is_running():
             menu.key_event('back', eventtime)
+    def _target_action(self, menu, target, kind, eventtime):
+        # A touch on the graphical UI: a status screen button, the menu title
+        # bar (back) or a menu row
+        what, arg = target
+        key = 'click' if kind == 'tap' else 'long_click'
+        if what == 'back':
+            if menu.is_running():
+                menu.key_event('back', eventtime)
+        elif what == 'row':
+            if menu.is_running():
+                self._select_row(menu, arg)
+                menu.key_event(key, eventtime)
+        elif what == 'button':
+            if arg == 'menu':
+                if not menu.is_running():
+                    menu.key_event('click', eventtime)
+            elif arg in ('pause', 'resume'):
+                self._run_gcode(arg.upper())
+    def _run_gcode(self, script):
+        gcode = self.printer.lookup_object('gcode')
+        def run(eventtime):
+            try:
+                gcode.run_script(script)
+            except Exception:
+                logging.exception("gt911_touch: %s failed", script)
+        self.reactor.register_callback(run)
     def _select_row(self, menu, row):
         from .display import menu as menu_mod
         container = menu.stack_peek()

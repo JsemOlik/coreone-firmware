@@ -778,6 +778,21 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   first start with `[display]` on a CORE One L. It now runs from the health timer 2 s after
   ready. The liveness compare also ignores the leading dummy byte, which the panel clocks out
   only some of the time (`9c 00 00` vs `00 9c 00` read as "panel changed state"). — 2026-11-11
+- **xLCD graphical UI** — ⚠ **NOT YET VALIDATED ON HARDWARE** (rendered offline only).
+  `src/stm32/display_dma.c` gains two drawing primitives: `display_dma_fill` (a solid rectangle;
+  ring segments now carry a repeat count, so a fill of any size is a few ring slots replaying one
+  16-pixel buffer) and `display_dma_aa` + `display_dma_aa_data` (anti-aliased text: a window,
+  then run-length coded 4-bit coverage blended between fg and bg on the MCU).
+  `klippy/extras/ili9488_ui.py` draws a status screen (state header, nozzle/bed/chamber tiles
+  coloured by heater state, job progress with elapsed/remaining time or the toolhead position,
+  Menu and Pause/Resume touch buttons) and restyles the Klipper menu (title bar that goes back
+  when touched, 46 px rows, highlighted selection, edit colour, submenu chevrons). Text uses
+  DejaVu Sans rendered by `scripts/gen_aa_fonts.py` into `klippy/extras/display/font_aa.py`.
+  Widgets tile the screen and are redrawn only when they change; while printing or probing the
+  draw queue drains under a byte budget (`ui_busy_bytes`, `ui_menu_bytes`), every 50 ms between
+  display updates except during a probe, so the DMA ring never back-pressures. An MCU without
+  the new commands, or `ui: text`, keeps the char-grid UI. `gt911_touch` hit-tests the buttons,
+  title bar and rows through the lcd (`touch_target`). — 2026-11-11
 - **xLCD touch: GT911 driving the Klipper menu** — ⚠ **PARTLY VALIDATED ON HARDWARE** (detection,
   orientation and gestures on a CORE One L; menu use pending).
   `klippy/extras/gt911_touch.py` (host only, no MCU change): polls the GT911 status register

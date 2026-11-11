@@ -12,12 +12,16 @@
 # and re-renders only changed cells (each a scaled RGB666 blit), so updates are
 # small. Over 4-wire SPI the ILI9488 is RGB666 (3 B/px); the panel is BGR-ordered.
 #
+# On an MCU with the display_dma fill/aa commands the screen is drawn by the
+# graphical UI of ili9488_ui.py instead (ui: graphic, the default); the char
+# grid then only carries the menu text.
+#
 # Copyright (C) 2026
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 
 NSEG_HINT = 512   # src/display_dma.c NSEG -- for reporting ring depth
-from . import bus
+from . import bus, ili9488_ui
 from .display.font8x14 import VGA_FONT
 
 BACKGROUND_PRIORITY_CLOCK = 0x7fffffff00000000
@@ -49,6 +53,10 @@ EMPTY = bytes(16)
 # of 72, so the link is no longer what limits it. Back off to 4 (the long-validated
 # value) if the display ever misbehaves during a probe.
 DMA_CELLS_PER_FLUSH = 6
+# Graphical UI: panel bytes per flush while printing (one DMA ring's worth, so
+# the producer never waits) and while a menu is open during a print
+UI_BUSY_BYTES = 24000
+UI_MENU_BYTES = 64000
 
 # Colour palette, BGR666 (panel is BGR-ordered; low 2 bits ignored).
 C_WHITE = bytes([0xFC, 0xFC, 0xFC])
@@ -131,6 +139,17 @@ class ILI9488:
         self.icons = {}
         self.fb = [[bytearray(EMPTY) for _ in range(self.cols)]
                    for _ in range(self.rows)]
+        # The characters behind the cells, which the graphical menu draws
+        self.chars = [bytearray(self.cols) for _ in range(self.rows)]
+        # Graphical status screen and menu (ui: text keeps the char grid)
+        self.ui = None
+        if config.getchoice('ui', {'graphic': True, 'text': False},
+                            'graphic'):
+            self.ui = ili9488_ui.GraphicUI(self, config)
+        self.ui_busy_bytes = config.getint('ui_busy_bytes', UI_BUSY_BYTES,
+                                           minval=1000)
+        self.ui_menu_bytes = config.getint('ui_menu_bytes', UI_MENU_BYTES,
+                                           minval=1000)
         self.shown = [[bytearray(EMPTY) for _ in range(self.cols)]
                       for _ in range(self.rows)]
         # Per-cell foreground colour (icons get tinted; text stays white).
@@ -487,6 +506,8 @@ class ILI9488:
             self._glyph_cmd = None
             logging.info("ili9488: MCU has no display_dma_glyph;"
                          " using the expanded-pixel path")
+        if self.ui is not None and not self.ui.build(self.mcu):
+            self.ui = None
 
     def _seg(self, cs, dc, data):
         # Enqueue one segment: CS/DC levels (applied first) + optional bytes.
@@ -551,10 +572,24 @@ class ILI9488:
     def get_dimensions(self):
         return (self.cols, self.rows)
 
+    def touch_target(self, x, y):
+        # What a touch at panel pixel x, y hits on the graphical UI, or None
+        # when the char grid is showing
+        if self.ui is None:
+            return None
+        return self.ui.touch_target(x, y)
+
+    def menu_row_height(self):
+        if self.ui is None:
+            return 16 * self.scale
+        return ili9488_ui.MENU_ROW_H
+
     def clear(self):
         for row in self.fb:
             for cell in row:
                 cell[:] = EMPTY
+        for row in self.chars:
+            row[:] = bytes(self.cols)
         for y in range(self.rows):
             row = self.fgmap[y]
             for x in range(self.cols):
@@ -573,6 +608,7 @@ class ILI9488:
             if x + i >= self.cols:
                 break
             self.fb[y][x + i][:] = self.font[c]
+            self.chars[y][x + i] = c
 
     def _heater_color(self, hname):
         obj = self._extruder if hname == 'extruder' else self._heater_bed
@@ -668,6 +704,18 @@ class ILI9488:
         if self._init_pt and self.mcu.estimated_print_time(
                 self.reactor.monotonic()) < self._init_pt:
             return
+        if self.ui is not None:
+            if not (self._probing or self._printing()):
+                budget = None
+            elif self._probing:
+                budget = self.ui_busy_bytes
+            elif self._menu_running():
+                budget = self.ui_menu_bytes
+            else:
+                budget = self.ui_busy_bytes
+            self.ui.flush(budget, self._menu_running(),
+                          self.reactor.monotonic())
+            return
         # Idle -> uncapped (snappy menu nav). Loadcell probe tap -> always the
         # protective dma_cells cap (the critical window). Printing with a menu
         # open -> raised menu_cells cap so the menu repaints instead of being
@@ -734,6 +782,8 @@ class ILI9488:
         for row in self.shown:
             for cell in row:
                 cell[:] = b'\xff' * 16
+        if self.ui is not None:
+            self.ui.invalidate()
 
     def _bl_ready(self):
         now = self.reactor.monotonic()
