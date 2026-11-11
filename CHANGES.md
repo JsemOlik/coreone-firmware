@@ -776,16 +776,19 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   inside the ready handler, where the reactor cannot pause; it failed, and its late reply then
   crashed the reactor ("Unhandled exception during run", `timer_is_running` on None) on the
   first start with `[display]` on a CORE One L. It now runs from the health timer 2 s after
-  ready. — 2026-11-11
-- **xLCD touch: GT911 driving the Klipper menu** — ⚠ **SHIPPED-UNVALIDATED**.
+  ready. The liveness compare also ignores the leading dummy byte, which the panel clocks out
+  only some of the time (`9c 00 00` vs `00 9c 00` read as "panel changed state"). — 2026-11-11
+- **xLCD touch: GT911 driving the Klipper menu** — ⚠ **PARTLY VALIDATED ON HARDWARE** (detection,
+  orientation and gestures on a CORE One L; menu use pending).
   `klippy/extras/gt911_touch.py` (host only, no MCU change): polls the GT911 status register
   (0x814E) over a bit-banged bus on the I2C3 pins (PA8/PC9), probing both addresses (0x5D/0x14,
   set by INT at the shared display reset). Writes Prusa's controller config when it differs
   (checksum recomputed; Buddy's stored 0xaf is stale). Taps select and run menu rows, long press
   = long click, vertical swipes scroll or change the edited value, swipe right = back; a tap on
   the status screen opens the menu, the first touch on a dimmed backlight only wakes it.
-  Touches seen in fewer than two polls are dropped (stand-in for Buddy's EMC ghost-touch
-  filter); polling pauses during homing/probing moves; bus errors re-detect instead of shutting
+  Anything shorter than a swipe (40 px) is a tap, since fingers drift 10-20 px while tapping.
+  Touches lasting under two 30 ms polls are dropped (stand-in for Buddy's EMC ghost-touch
+  filter; a still finger counts although the controller only reports movement); polling pauses during homing/probing moves; bus errors re-detect instead of shutting
   down. Bit-banged because the stm32f4 hardware I2C code leaves the NACK flag set after the
   probe of the absent address. `TOUCH_STATUS`, `TOUCH_TEST`, `TOUCH_ENABLE`. Exercised against a
   register-level GT911 fake and a batch config run. — 2026-11-11

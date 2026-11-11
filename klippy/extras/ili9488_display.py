@@ -240,6 +240,12 @@ class ILI9488:
                          self.health_period)
 
     @staticmethod
+    def _same_state(a, b):
+        # The dummy byte ahead of the reply is not always clocked out, so the
+        # same status can arrive shifted by a byte (9c 00 00 vs 00 9c 00)
+        return bytes(a).strip(b'\x00') == bytes(b).strip(b'\x00')
+
+    @staticmethod
     def _implausible(data):
         """All-zero or all-ones means nobody drove the bus, not that the panel died."""
         if not data:
@@ -319,7 +325,7 @@ class ILI9488:
         st = self._panel_read(self.health_reg, 2)
         if st is None:
             return nxt             # busy, transient, or unsupported: no verdict
-        if self._implausible(st) or bytes(st) != self._rd_base:
+        if self._implausible(st) or not self._same_state(st, self._rd_base):
             self._panel_bad = 1
             if not self._panel_warned:
                 self._panel_warned = True
@@ -367,7 +373,7 @@ class ILI9488:
             lines.append("  liveness verdict: UNKNOWN (no usable reading)")
         elif self._implausible(rd):
             lines.append("  liveness verdict: PANEL NOT RESPONDING")
-        elif bytes(rd) != self._rd_base:
+        elif not self._same_state(rd, self._rd_base):
             lines.append("  liveness verdict: PANEL CHANGED STATE (reset/slept?)")
         else:
             lines.append("  liveness verdict: panel alive (matches baseline)")

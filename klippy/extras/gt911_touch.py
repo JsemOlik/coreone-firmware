@@ -28,9 +28,8 @@
 # #swap_xy: False
 # #invert_x: False
 # #invert_y: False
-# #poll_interval: 0.05
-# #tap_tolerance: 12      (pixels a tap may move)
-# #swipe_distance: 30     (pixels a swipe must move)
+# #poll_interval: 0.03
+# #swipe_distance: 40     (pixels; anything shorter is a tap)
 # #long_press_time: 0.8
 # #min_touch_polls: 2     (shorter touches are dropped as noise)
 # #update_config: True    (write Prusa's controller config if it differs)
@@ -73,12 +72,13 @@ def config_with_checksum(cfg):
     return body + bytes([(-sum(body)) & 0xff, 0x01])
 
 # Gesture recognition (result of one touch, decided on release)
-def classify(start, end, duration, tap_tolerance, swipe_min,
-             long_press_time):
+def classify(start, end, duration, swipe_min, long_press_time):
+    # Fingers drift 10-20 px during a tap, so anything shorter than a
+    # swipe counts as a tap
     dx = end[0] - start[0]
     dy = end[1] - start[1]
     adx, ady = abs(dx), abs(dy)
-    if adx <= tap_tolerance and ady <= tap_tolerance:
+    if adx < swipe_min and ady < swipe_min:
         if duration >= long_press_time:
             return 'long_press', 0
         return 'tap', 0
@@ -110,11 +110,10 @@ class GT911Touch:
         self.swap_xy = config.getboolean('swap_xy', False)
         self.invert_x = config.getboolean('invert_x', False)
         self.invert_y = config.getboolean('invert_y', False)
-        self.poll_time = config.getfloat('poll_interval', .05,
+        self.poll_time = config.getfloat('poll_interval', .03,
                                          minval=.02, maxval=.5)
         self.start_delay = config.getfloat('start_delay', 2., minval=0.)
-        self.tap_tolerance = config.getint('tap_tolerance', 12, minval=0)
-        self.swipe_min = config.getint('swipe_distance', 30, minval=1)
+        self.swipe_min = config.getint('swipe_distance', 40, minval=1)
         self.long_press_time = config.getfloat('long_press_time', .8,
                                                above=0.)
         self.min_polls = config.getint('min_touch_polls', 2, minval=1)
@@ -242,20 +241,29 @@ class GT911Touch:
                 self.state = 'not found'
                 return eventtime + 5.
             return eventtime + self.poll_time
-        data = self._read(REG_STATUS, 9)
+        data = self._read(REG_STATUS, 1)
         if data is None:
             return self._poll_error(eventtime)
         self.errors = 0
         status = data[0]
         if not status & 0x80:
+            # No new report. The controller only reports when the point
+            # moves, so a still finger is still down.
+            if self.touch is not None:
+                self.touch['polls'] += 1
             return eventtime + self.poll_time
+        count = status & 0x0f
+        point = b''
+        if 0 < count <= 5:
+            point = self._read(REG_STATUS + 1, 8)
+            if point is None:
+                return self._poll_error(eventtime)
         if not self._write(REG_STATUS, [0]):
             return self._poll_error(eventtime)
-        count = status & 0x0f
         if count > 5:
             self.touch = None
             return eventtime + self.poll_time
-        self._update_touch(eventtime, count, data[1:])
+        self._update_touch(eventtime, count, point)
         return eventtime + self.poll_time
     def _poll_error(self, eventtime):
         self.errors += 1
@@ -283,8 +291,13 @@ class GT911Touch:
         t = self.touch
         if count == 0:
             self.touch = None
-            if t is not None and t['valid'] and t['polls'] >= self.min_polls:
+            if t is None:
+                return
+            if t['valid'] and t['polls'] >= self.min_polls:
                 self._gesture(eventtime, t)
+            elif eventtime < self.test_until:
+                self._respond("touch: ignored (%s)" % (
+                    "several fingers" if not t['valid'] else "too short",))
             return
         if t is None:
             pos = self._point(pt)
@@ -299,14 +312,12 @@ class GT911Touch:
     # Gestures -> menu
     def _gesture(self, eventtime, t):
         kind, dist = classify(t['start'], t['last'], eventtime - t['time'],
-                              self.tap_tolerance, self.swipe_min,
-                              self.long_press_time)
+                              self.swipe_min, self.long_press_time)
         self.last_event = (kind, t['start'], t['last'])
         if eventtime < self.test_until:
-            gcode = self.printer.lookup_object('gcode')
-            gcode.respond_info("touch: %s from %d,%d to %d,%d (%.2fs)" % (
-                kind, t['start'][0], t['start'][1], t['last'][0],
-                t['last'][1], eventtime - t['time']))
+            self._respond("touch: %s from %d,%d to %d,%d (%.2fs)" % (
+                kind or "unclear (diagonal)", t['start'][0], t['start'][1],
+                t['last'][0], t['last'][1], eventtime - t['time']))
             return
         if kind is None:
             return
@@ -314,6 +325,8 @@ class GT911Touch:
             self._menu_action(eventtime, kind, dist, t['start'])
         except Exception:
             logging.exception("gt911_touch: menu action failed")
+    def _respond(self, msg):
+        self.printer.lookup_object('gcode').respond_info(msg)
     def _menu_action(self, eventtime, kind, dist, pos):
         display = self.display
         menu = getattr(display, 'menu', None)
