@@ -772,6 +772,18 @@ copyright notices and per-file license headers are **retained unchanged**; the l
 - PuppyBus RS-485 master, used to *flash* the H503 enclosure MCU (at runtime the H503 is a
   second Klipper MCU on its own USB); TCA6408A I/O expander. — 2026-06
 
+- **xLCD touch: GT911 driving the Klipper menu** — ⚠ **SHIPPED-UNVALIDATED**.
+  `klippy/extras/gt911_touch.py` (host only, no MCU change): polls the GT911 status register
+  (0x814E) over a bit-banged bus on the I2C3 pins (PA8/PC9), probing both addresses (0x5D/0x14,
+  set by INT at the shared display reset). Writes Prusa's controller config when it differs
+  (checksum recomputed; Buddy's stored 0xaf is stale). Taps select and run menu rows, long press
+  = long click, vertical swipes scroll or change the edited value, swipe right = back; a tap on
+  the status screen opens the menu, the first touch on a dimmed backlight only wakes it.
+  Touches seen in fewer than two polls are dropped (stand-in for Buddy's EMC ghost-touch
+  filter); polling pauses during homing/probing moves; bus errors re-detect instead of shutting
+  down. Bit-banged because the stm32f4 hardware I2C code leaves the NACK flag set after the
+  probe of the absent address. `TOUCH_STATUS`, `TOUCH_TEST`, `TOUCH_ENABLE`. Exercised against a
+  register-level GT911 fake and a batch config run. — 2026-11-11
 - **CORE One L mains bed: AC Controller over Cyphal/CAN FD** — ⚠ **PARTLY VALIDATED ON HARDWARE**
   (node allocation, status, heat-and-hold at 60 °C and 100 °C (±0.3 °C, ~50→100 °C in under
   3 min, ≤577 W), bed-off on watchdog, on MCU shutdown and when the Klipper process is killed,
