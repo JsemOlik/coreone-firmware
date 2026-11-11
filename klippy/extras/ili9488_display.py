@@ -203,6 +203,19 @@ class ILI9488:
 
     # --- panel health -------------------------------------------------------
     def _hq_ready(self):
+        # A query cannot wait for its reply inside the klippy:ready handler
+        # (reactor pause is disabled there; the late reply then crashed the
+        # reactor), so the baseline read runs from a timer once init is done.
+        self._hq_timer = self.reactor.register_timer(
+            self._hq_poll, self.reactor.monotonic() + 2.)
+
+    def _hq_poll(self, eventtime):
+        if self._rd_base is None and not self._rd_unavailable:
+            self._hq_baseline()
+            return eventtime + self.health_period
+        return self._hq_event(eventtime)
+
+    def _hq_baseline(self):
         # Establish the read-back BASELINE first. ⚠ THE DISCRIMINATOR FOR THIS
         # DESIGN: a board that does not route SDO reads all 0x00 or all 0xFF, which
         # is INDISTINGUISHABLE from a dead panel. So the detector only arms if the
@@ -225,8 +238,6 @@ class ILI9488:
                          " liveness check armed at %.0f s",
                          self.health_reg, " ".join("%02x" % b for b in st),
                          self.health_period)
-        self._hq_timer = self.reactor.register_timer(
-            self._hq_event, self.reactor.monotonic() + self.health_period)
 
     @staticmethod
     def _implausible(data):

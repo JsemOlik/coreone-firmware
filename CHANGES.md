@@ -772,6 +772,11 @@ copyright notices and per-file license headers are **retained unchanged**; the l
 - PuppyBus RS-485 master, used to *flash* the H503 enclosure MCU (at runtime the H503 is a
   second Klipper MCU on its own USB); TCA6408A I/O expander. — 2026-06
 
+- **ili9488: panel health baseline read moved out of `klippy:ready`.** The read-back query ran
+  inside the ready handler, where the reactor cannot pause; it failed, and its late reply then
+  crashed the reactor ("Unhandled exception during run", `timer_is_running` on None) on the
+  first start with `[display]` on a CORE One L. It now runs from the health timer 2 s after
+  ready. — 2026-11-11
 - **xLCD touch: GT911 driving the Klipper menu** — ⚠ **SHIPPED-UNVALIDATED**.
   `klippy/extras/gt911_touch.py` (host only, no MCU change): polls the GT911 status register
   (0x814E) over a bit-banged bus on the I2C3 pins (PA8/PC9), probing both addresses (0x5D/0x14,
