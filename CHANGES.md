@@ -773,8 +773,9 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   second Klipper MCU on its own USB); TCA6408A I/O expander. — 2026-06
 
 - **CORE One L mains bed: AC Controller over Cyphal/CAN FD** — ⚠ **PARTLY VALIDATED ON HARDWARE**
-  (node allocation, status, 35 °C heating, bed-off on watchdog and on MCU shutdown, latched-fault
-  recovery; higher temperatures pending).
+  (node allocation, status, heat-and-hold at 60 °C and 100 °C (±0.3 °C, ~50→100 °C in under
+  3 min, ≤577 W), bed-off on watchdog, on MCU shutdown and when the Klipper process is killed,
+  latched-fault recovery).
   `src/stm32/fdcan_raw.c` (H503 only): a raw CAN FD frame bridge on FDCAN1 (PB5/PB6, 125 kbit/s
   nominal, no BRS, timing from Buddy `hal_pub.cpp`), host-paced 1 frame/ms, drops off the bus on MCU
   shutdown. `klippy/extras/cyphal_can.py`: minimal Cyphal/CAN transport (framing, CRC, reassembly)
