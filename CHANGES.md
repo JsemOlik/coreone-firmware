@@ -845,7 +845,7 @@ copyright notices and per-file license headers are **retained unchanged**; the l
   chamber fans regulate down to the `M141` target with Buddy's integrating ("legacy") controller
   (1.5 PWM steps per °C per second, minimum 40/255), and run flat out above the overheat limit
   until the chamber is back below the recovery temperature (`cooling.cpp`). `M141`, `M191` (S/R/C,
-  ±3 °C, warns after 30 min), `SET_CHAMBER_FAN SPEED=|AUTO=1`. The regulator runs in the sensor
+  ±3 °C, warns after 30 min), `SET_CHAMBER_FAN SPEED=|AUTO=1`, `CHAMBER_STATUS`. The regulator runs in the sensor
   callback, so it keeps working while the G-code queue waits in `M190`/`M191`. Control law
   exercised offline; config checked in a batch run. — 2026-11-12
 - **CORE One L BBF** — `pack-bbf.sh` / `verify-bbf.py` take `PRINTER=coreonel` (printer type 8);

@@ -72,6 +72,8 @@ class PrusaChamber:
                                desc=self.cmd_M191_help)
         gcode.register_command('SET_CHAMBER_FAN', self.cmd_SET_CHAMBER_FAN,
                                desc=self.cmd_SET_CHAMBER_FAN_help)
+        gcode.register_command('CHAMBER_STATUS', self.cmd_CHAMBER_STATUS,
+                               desc=self.cmd_CHAMBER_STATUS_help)
     def _handle_connect(self):
         if self.bed_heater_name is not None:
             pheaters = self.printer.lookup_object('heaters')
@@ -186,6 +188,26 @@ class PrusaChamber:
         else:
             self.manual_speed = gcmd.get_float('SPEED', minval=0., maxval=1.)
         self.next_speed_time = 0.
+
+    cmd_CHAMBER_STATUS_help = "Report chamber temperature and fan state"
+    def cmd_CHAMBER_STATUS(self, gcmd):
+        eventtime = self.printer.get_reactor().monotonic()
+        status = self.get_status(eventtime)
+        if self.manual_speed is not None:
+            mode = "manual"
+        elif self.target is not None:
+            mode = "auto"
+        else:
+            mode = "off"
+        rpm = status.get('rpm')
+        gcmd.respond_info(
+            "Chamber %.1f C (thermistor %.1f C), target %s\n"
+            "Fans %.0f%% (%s%s)%s" % (
+                self.temp, self.raw_temp,
+                "%.0f C" % (self.target,) if self.target else "none",
+                self.last_speed * 100., mode,
+                ", overheated" if self.overheated else "",
+                ", %.0f RPM" % (rpm,) if rpm is not None else ""))
 
 def load_config(config):
     return PrusaChamber(config)
