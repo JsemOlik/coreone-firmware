@@ -839,6 +839,15 @@ copyright notices and per-file license headers are **retained unchanged**; the l
     Klipper down; with a bed target set they still shut down, and new bed targets are refused
     until the fault clears. Both AC tests leave the bed target at 0. Confirmed on the printer
     (restart, re-allocation, `start_app`, operational again; Klipper stays ready). — 2026-11-11
+- **CORE One chamber regulation** (`klippy/extras/prusa_chamber.py`) — ⚠ **UNVALIDATED ON
+  HARDWARE**. Buddy's chamber logic for the xBuddy-extension fans: the chamber thermistor is
+  corrected for its position next to the bed (`chamber.cpp`, gain configurable, L default), the
+  chamber fans regulate down to the `M141` target with Buddy's integrating ("legacy") controller
+  (1.5 PWM steps per °C per second, minimum 40/255), and run flat out above the overheat limit
+  until the chamber is back below the recovery temperature (`cooling.cpp`). `M141`, `M191` (S/R/C,
+  ±3 °C, warns after 30 min), `SET_CHAMBER_FAN SPEED=|AUTO=1`. The regulator runs in the sensor
+  callback, so it keeps working while the G-code queue waits in `M190`/`M191`. Control law
+  exercised offline; config checked in a batch run. — 2026-11-12
 - **CORE One L BBF** — `pack-bbf.sh` / `verify-bbf.py` take `PRINTER=coreonel` (printer type 8);
   the Core One (type 7) stays the default. — 2026-11-10
 - `phase_exec` now refuses a stepper not at `microsteps: 16` (the MCU phase frame assumes 16). —
